@@ -138,6 +138,7 @@ uv.lock
 *.json.backup
 *.json.bak
 .blocklist.json
+blocklist.json.backup
 
 # Temporary files
 *.tmp

@@ -71,6 +71,68 @@ You can find further readily available blocklists on the following sites.
  - https://lists.blocklist.de
  - https://www.ipdeny.com/ipblocks/
 
+### Country-Based Blocking
+
+The included `blocklist.json` contains IP blocks for **all countries except the United States**.
+This is useful for blocking international traffic to services that should only be accessible domestically.
+
+**⚠️ IMPORTANT WARNINGS:**
+
+1. **This will block ALL traffic from non-US IP addresses** - including:
+   - Legitimate international users
+   - VPN users appearing to be from other countries
+   - Cloud services hosted internationally
+   - CDN endpoints
+   - Your own traffic if traveling abroad
+
+2. **System Resource Impact:**
+   - **232 ipsets** will be created (one per country)
+   - Each ipset can contain thousands of IP blocks
+   - This uses significant system memory
+   - Initial population can take 10-30 minutes
+   - Recommended minimum: 4GB RAM
+
+3. **Firewall Performance:**
+   - More ipsets = slower firewall rule processing
+   - May impact network performance on high-traffic systems
+   - Consider blocking only high-risk countries instead of all countries
+
+**Alternative Approach - Block Specific Countries:**
+
+Instead of blocking all countries except US, consider blocking only high-risk countries:
+
+```json
+{
+    "https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone": "country-cn",
+    "https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone": "country-ru",
+    "https://www.ipdeny.com/ipblocks/data/aggregated/kp-aggregated.zone": "country-kp",
+    "https://www.ipdeny.com/ipblocks/data/aggregated/ir-aggregated.zone": "country-ir"
+}
+```
+
+**Helper Script - `generate-blocklist.py`:**
+
+Use the included helper script to easily switch between different blocklist configurations:
+
+```bash
+# Generate blocklist for only common threat countries (RECOMMENDED)
+./generate-blocklist.py --mode block-threats
+
+# Generate blocklist blocking all countries except US (current config)
+./generate-blocklist.py --mode allow-us
+
+# Generate blocklist for specific countries
+./generate-blocklist.py --mode block-specific --countries cn,ru,ir,kp
+
+# Revert to original blocklist.de configuration
+./generate-blocklist.py --mode blocklist-de
+```
+
+**To restore the original blocklist.de configuration manually:**
+```bash
+cp blocklist.json.backup blocklist.json
+```
+
 ### How It Works
 
 The script automatically creates **firewalld rich rules** that apply ipsets to specific ports:
@@ -92,8 +154,22 @@ If you add custom ipsets that don't match the naming pattern, they'll be added t
 
 ### Initial Setup
 
+**IMPORTANT:** The current `blocklist.json` blocks ALL countries except the US (232 countries).
+This may not be what you want! Consider using the threat-only mode instead:
+
+```bash
+# RECOMMENDED: Generate threat-only blocklist (6 countries)
+./generate-blocklist.py --mode block-threats
+
+# Then run the setup
+sudo python3 blocklist-firewalld.py
+```
+
+**Or proceed with the full country block:**
+
 ```bash
 # Run the full setup (create ipsets, flush, and populate)
+# WARNING: This will block 232 countries and take 10-30 minutes
 sudo python3 blocklist-firewalld.py
 ```
 
