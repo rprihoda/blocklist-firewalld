@@ -1,2 +1,3 @@
 # Dependencies for blocklist-firewalld
-pycurl>=7.45.0
+# No external Python dependencies required
+# The script uses system commands: firewall-cmd, ipset, curl, sed

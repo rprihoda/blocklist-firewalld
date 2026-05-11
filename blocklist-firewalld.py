@@ -97,8 +97,6 @@ if __name__ == "__main__":
         import tempfile
         from pathlib import Path
 
-        import pycurl
-
         for list in lists:
             with tempfile.TemporaryDirectory() as tmpdirname:
                 tmpdir = Path(tmpdirname)

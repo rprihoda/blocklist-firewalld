@@ -1,6 +1,32 @@
 # blocklist-firewalld
 Create [ipset](https://ipset.netfilter.org/) lists from blocklists managed by [firewalld](https://firewalld.org/).
 
+## Requirements
+
+### System Requirements
+- Python 3.7 or higher
+- firewalld
+- ipset
+- curl
+- sed
+
+### Python Dependencies
+No external Python packages required! This script uses only Python standard library.
+
+### Installation
+
+```bash
+# Clone the repository
+git clone <repository-url>
+cd blocklist-firewalld
+
+# Make the script executable
+chmod +x blocklist-firewalld.py
+
+# Copy to your preferred location (optional)
+sudo cp blocklist-firewalld.py /usr/local/bin/
+```
+
 ## Manual
 
 ```
