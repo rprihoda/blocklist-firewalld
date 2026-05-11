@@ -1,0 +1,62 @@
+[project]
+name = "blocklist-firewalld"
+version = "1.0.0"
+description = "Create ipset lists from blocklists managed by firewalld"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["firewalld", "ipset", "blocklist", "security", "firewall"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking :: Firewalls",
+]
+
+dependencies = [
+    "pycurl>=7.45.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/blocklist-firewalld"
+Repository = "https://github.com/yourusername/blocklist-firewalld.git"
+Issues = "https://github.com/yourusername/blocklist-firewalld/issues"
+
+[project.scripts]
+blocklist-firewalld = "blocklist_firewalld:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["blocklist_firewalld*"]
+
+# uv specific configuration
+[tool.uv]
+dev-dependencies = []
+
+# Optional: Black code formatter configuration
+[tool.black]
+line-length = 88
+target-version = ['py37']
+
+# Optional: isort import sorter configuration
+[tool.isort]
+profile = "black"
+line_length = 88

@@ -1,0 +1,2 @@
+# Dependencies for blocklist-firewalld
+pycurl>=7.45.0
