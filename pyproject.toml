@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.7"
 license = {file = "LICENSE"}
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Ryan Prihoda", email = "ryanprihoda@gmail.com"}
 ]
 keywords = ["firewalld", "ipset", "blocklist", "security", "firewall"]
 classifiers = [
@@ -29,9 +29,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/blocklist-firewalld"
-Repository = "https://github.com/yourusername/blocklist-firewalld.git"
-Issues = "https://github.com/yourusername/blocklist-firewalld/issues"
+Homepage = "https://github.com/rprihoda/blocklist-firewalld"
+Repository = "https://github.com/rprihoda/blocklist-firewalld.git"
+Issues = "https://github.com/rprihoda/blocklist-firewalld/issues"
 
 [project.scripts]
 blocklist-firewalld = "blocklist_firewalld:main"
