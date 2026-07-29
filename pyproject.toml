@@ -42,11 +42,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = []
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["blocklist_firewalld*"]
+# Single-file module. blocklist-firewalld.py is a symlink to it so the script
+# can still be run (and copied) directly, as the README describes.
+py-modules = ["blocklist_firewalld"]
 
 # uv specific configuration
 [tool.uv]
