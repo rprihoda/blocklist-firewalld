@@ -191,14 +191,85 @@ sudo python3 blocklist-firewalld.py --clean
 
 ### Verify Configuration
 
+All ipsets are created as **permanent firewalld ipsets**, so you can inspect
+them directly with `firewall-cmd` (no need to fall back to the raw `ipset` tool).
+
+**List the names of all ipsets known to firewalld:**
+
 ```bash
-# Check if ipsets were created
 sudo firewall-cmd --get-ipsets
+```
 
-# View rich rules in your default zone
+```
+blocklist-ssh blocklist-80 blocklist-443
+```
+
+**Show an ipset's configuration (type, options) and its entries:**
+
+```bash
+sudo firewall-cmd --info-ipset=blocklist-ssh
+```
+
+```
+blocklist-ssh
+  type: hash:net
+  options: family=inet hashsize=4096 maxelem=200000
+  entries: 1.2.3.4 5.6.7.8 203.0.113.0/24
+```
+
+**List only the entries (IPs / networks) in an ipset:**
+
+```bash
+sudo firewall-cmd --ipset=blocklist-ssh --get-entries
+```
+
+```
+1.2.3.4
+5.6.7.8
+203.0.113.0/24
+```
+
+**Count how many entries an ipset currently holds:**
+
+```bash
+sudo firewall-cmd --ipset=blocklist-ssh --get-entries | wc -l
+```
+
+```
+1523
+```
+
+**View the rich rules in your default zone (shows which ipsets block which ports):**
+
+```bash
 sudo firewall-cmd --list-rich-rules
+```
 
-# Check ipset contents
+```
+rule source ipset="blocklist-ssh" port port="22" protocol="tcp" drop
+rule source ipset="blocklist-80" port port="80" protocol="tcp" drop
+rule source ipset="blocklist-443" port port="443" protocol="tcp" drop
+```
+
+**For ipsets without a port mapping, confirm they are bound to the drop zone:**
+
+```bash
+sudo firewall-cmd --zone=drop --list-sources
+```
+
+```
+ipset:country-cn ipset:country-ru
+```
+
+> **Note:** `--get-ipsets`, `--info-ipset`, and `--get-entries` operate on the
+> **runtime** configuration by default. Add `--permanent` to inspect the
+> permanent configuration instead (e.g. `sudo firewall-cmd --permanent --get-ipsets`).
+> If runtime and permanent differ, run `sudo firewall-cmd --reload` to apply the
+> permanent configuration.
+
+You can still inspect entries with the raw `ipset` tool if you prefer:
+
+```bash
 sudo ipset list blocklist-ssh
 ```
 
