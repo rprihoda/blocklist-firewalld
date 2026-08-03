@@ -10,6 +10,7 @@ Sub-commands:
   revert    undo every firewall change: rules *and* ipsets
   generate  write a blocklist.json configuration
   show      show the current state of the managed ipsets and rules
+  cloudflare  manage the Cloudflare allowlist (never block Cloudflare itself)
 """
 
 from __future__ import annotations
@@ -83,6 +84,53 @@ BLOCKLIST_DE = {
     "https://lists.blocklist.de/lists/80.txt": "blocklist-80",
     "https://lists.blocklist.de/lists/443.txt": "blocklist-443",
 }
+
+# Cloudflare's IP ranges are shared by every site behind Cloudflare. If any
+# other Cloudflare-fronted site gets attacked and its logs show Cloudflare's
+# edge IP as the source, that IP can land on abuse lists like blocklist.de -
+# and then in *your* ipsets, blocking Cloudflare itself from reaching your
+# origin. Country-based blocking has the same problem: it can drop whole
+# netblocks that include Cloudflare PoPs. See ensure_cloudflare_allowlist().
+CLOUDFLARE_IPV4_URL = "https://www.cloudflare.com/ips-v4"
+CLOUDFLARE_IPV6_URL = "https://www.cloudflare.com/ips-v6"
+CLOUDFLARE_IPSET_V4 = "cloudflare-allow"
+CLOUDFLARE_IPSET_V6 = "cloudflare-allow6"
+CLOUDFLARE_IPSETS = (CLOUDFLARE_IPSET_V4, CLOUDFLARE_IPSET_V6)
+# Lower than any rich rule's default priority (0), so this ACCEPT is always
+# evaluated - and wins, since rich rule actions are terminal - before a DROP
+# rule at the default priority.
+CLOUDFLARE_ACCEPT_PRIORITY = "-32000"
+
+# Used only if the live download fails (e.g. no internet access). Cloudflare's
+# ranges rarely change; run 'cloudflare refresh' to update this snapshot's
+# in-firewall copy whenever possible. Last synced 2026-07-29 from
+# cloudflare.com/ips-v4 and cloudflare.com/ips-v6.
+CLOUDFLARE_FALLBACK_V4 = (
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+)
+CLOUDFLARE_FALLBACK_V6 = (
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+)
 
 LEGACY_FLAGS = {
     "--create": "create",
@@ -325,12 +373,234 @@ def reload_firewalld(runner):
     fw(runner, "--reload", description="Reloading firewalld")
 
 
+def ensure_ipset(runner, name, family):
+    """Create a permanent ipset if missing. Returns True if it was created."""
+    if name in get_ipsets(runner, permanent=True):
+        runner.log("ipset already exists: " + name)
+        return False
+    non_family_options = [o for o in IPSET_OPTIONS if not o.startswith("family=")]
+    options = ["--option=family=" + family] + [
+        "--option=" + option for option in non_family_options
+    ]
+    result = fw(
+        runner,
+        "--permanent",
+        "--new-ipset=" + name,
+        "--type=" + IPSET_TYPE,
+        *options,
+        description="Creating ipset " + name,
+    )
+    return result.ok
+
+
+# --------------------------------------------------------------------------- #
+# Cloudflare allowlist
+#
+# Two ipsets (v4 + v6) populated with Cloudflare's official ranges, each
+# backed by a rich rule with a very low (negative) priority in every zone
+# this tool touches. Rich rule actions are terminal and evaluated in
+# ascending priority order, so this ACCEPT rule is always checked - and always
+# wins - before any DROP rule added at the default priority of 0, regardless
+# of what later shows up in an abuse blocklist or a country ipset.
+#
+# Deliberately NOT covered by MANAGED_PREFIXES: 'clean' and 'revert' must
+# never remove this safety net, even when clearing out every blocklist ipset.
+# --------------------------------------------------------------------------- #
+
+
+def cloudflare_zones(runner):
+    """Zones this tool has to protect: wherever it might add a DROP rule."""
+    return sorted({get_default_zone(runner), FALLBACK_ZONE})
+
+
+def cloudflare_accept_rule(name):
+    return "rule priority=%s source ipset=%s accept" % (
+        CLOUDFLARE_ACCEPT_PRIORITY,
+        name,
+    )
+
+
+def fetch_cloudflare_ranges(runner, url, fallback, tmpfile):
+    """Download url into tmpfile; fall back to the embedded snapshot on failure."""
+    if shutil.which("curl") is not None:
+        result = runner.run(
+            ["curl", "-sSfL", "--retry", "2", "-o", str(tmpfile), url],
+            description="Downloading " + url,
+        )
+        downloaded = result.ok and (
+            runner.dry_run or (tmpfile.is_file() and tmpfile.stat().st_size > 0)
+        )
+        if downloaded:
+            return
+        runner.warn("could not download %s; using the built-in snapshot instead" % url)
+    else:
+        runner.warn("curl not found; using the built-in Cloudflare IP snapshot")
+
+    if not runner.dry_run:
+        tmpfile.write_text("\n".join(fallback) + "\n")
+
+
+def ensure_cloudflare_allowlist(runner, zones=None):
+    """Create/refresh the Cloudflare allowlist ipsets and their accept rules.
+
+    Fully idempotent: existing ipsets and rules are left alone, but entries
+    are always re-downloaded so the ranges stay current. Safe (and cheap - two
+    small HTTP GETs) to call on every 'create'/'setup' run.
+
+    require_root/require_firewalld are re-checked here (cheap, idempotent) so
+    this is also safe to call directly, e.g. via 'cloudflare enable', not just
+    as a side effect of 'create'.
+    """
+    require_root(runner)
+    require_firewalld(runner)
+    zones = zones if zones is not None else cloudflare_zones(runner)
+
+    created = 0
+    for name, family in ((CLOUDFLARE_IPSET_V4, "inet"), (CLOUDFLARE_IPSET_V6, "inet6")):
+        if ensure_ipset(runner, name, family):
+            created += 1
+
+    ruled = 0
+    for zone in zones:
+        ruled_ipsets = set(
+            filter(None, (rule_ipset(r) for r in list_rich_rules(runner, zone)))
+        )
+        for name in CLOUDFLARE_IPSETS:
+            if name in ruled_ipsets:
+                runner.log("Cloudflare accept rule already present in zone " + zone)
+                continue
+            result = fw(
+                runner,
+                "--permanent",
+                "--zone=" + zone,
+                "--add-rich-rule=" + cloudflare_accept_rule(name),
+                description="Allowing Cloudflare (%s) ahead of block rules in zone %s"
+                % (name, zone),
+            )
+            if result.ok:
+                ruled += 1
+
+    # Reload now so newly-created ipsets/rules are active at runtime before we
+    # try to populate entries into them (mirrors create -> reload -> populate).
+    reload_firewalld(runner)
+
+    ipset_bin = find_ipset_binary()
+    populated = 0
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        tmpdir = Path(tmpdirname)
+        for name, url, fallback in (
+            (CLOUDFLARE_IPSET_V4, CLOUDFLARE_IPV4_URL, CLOUDFLARE_FALLBACK_V4),
+            (CLOUDFLARE_IPSET_V6, CLOUDFLARE_IPV6_URL, CLOUDFLARE_FALLBACK_V6),
+        ):
+            tmpfile = tmpdir / name
+            fetch_cloudflare_ranges(runner, url, fallback, tmpfile)
+
+            if ipset_bin is not None:
+                # Keep the ipset in sync if Cloudflare ever retires a range,
+                # instead of only ever adding to it.
+                runner.run(
+                    [ipset_bin, "flush", name],
+                    description="Flushing ipset " + name,
+                    quiet=True,
+                )
+
+            result = fw(
+                runner,
+                "--ipset=" + name,
+                "--add-entries-from-file=" + str(tmpfile),
+                description="Loading Cloudflare ranges into " + name,
+            )
+            if result.ok:
+                populated += 1
+
+    print(
+        "cloudflare allowlist: created %d ipset(s), added %d accept rule(s), "
+        "refreshed %d ipset(s)" % (created, ruled, populated)
+    )
+    return 0
+
+
+def cmd_cloudflare_disable(runner, assume_yes=False):
+    """Remove the Cloudflare allowlist: the accept rules AND the ipsets."""
+    require_root(runner)
+    require_firewalld(runner)
+
+    zones = cloudflare_zones(runner)
+    permanent = get_ipsets(runner, permanent=True)
+    present = sorted(name for name in CLOUDFLARE_IPSETS if name in permanent)
+    has_rules = any(
+        rule_ipset(rule) in CLOUDFLARE_IPSETS
+        for zone in zones
+        for rule in list_rich_rules(runner, zone)
+    )
+
+    if not present and not has_rules:
+        print("Cloudflare allowlist is not installed; nothing to do")
+        return 0
+
+    print("About to remove the Cloudflare allowlist.")
+    print(
+        "  Cloudflare will again be subject to your regular blocklists/country rules."
+    )
+    if not assume_yes and not runner.dry_run:
+        if not confirm("Continue?"):
+            print("aborted")
+            return 1
+
+    removed = remove_firewall_rules(runner, set(CLOUDFLARE_IPSETS))
+    deleted = 0
+    for name in present:
+        result = fw(
+            runner,
+            "--permanent",
+            "--delete-ipset=" + name,
+            description="Deleting ipset " + name,
+        )
+        if result.ok:
+            deleted += 1
+
+    reload_firewalld(runner)
+    print("removed %d rule(s), deleted %d ipset(s)" % (removed, deleted))
+    return 0
+
+
+def cmd_cloudflare_status(runner):
+    require_firewalld(runner)
+
+    zones = cloudflare_zones(runner)
+    runtime = get_ipsets(runner)
+    permanent = get_ipsets(runner, permanent=True)
+
+    print("Cloudflare allowlist ipsets:")
+    for name in CLOUDFLARE_IPSETS:
+        if name in runtime:
+            state = "active"
+        elif name in permanent:
+            state = "reload"
+        else:
+            state = "missing"
+        count = len(get_entries(runner, name)) if name in runtime else "-"
+        print("  %-20s %-9s entries: %s" % (name, state, count))
+
+    print()
+    print("accept rules:")
+    any_rule = False
+    for zone in zones:
+        for rule in list_rich_rules(runner, zone):
+            if rule_ipset(rule) in CLOUDFLARE_IPSETS:
+                any_rule = True
+                print("  zone %s: %s" % (zone, rule))
+    if not any_rule:
+        print("  none - Cloudflare is NOT protected; run 'cloudflare enable'")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # sub-command: create
 # --------------------------------------------------------------------------- #
 
 
-def cmd_create(runner, config):
+def cmd_create(runner, config, protect_cloudflare=True):
     require_root(runner)
     require_firewalld(runner)
 
@@ -388,6 +658,10 @@ def cmd_create(runner, config):
 
     reload_firewalld(runner)
     print("created %d ipset(s), added %d firewall rule(s)" % (created, ruled))
+
+    if protect_cloudflare:
+        ensure_cloudflare_allowlist(runner)
+
     return 0
 
 
@@ -642,9 +916,12 @@ def cmd_show(runner, config, counts=True):
             entries = "-"
         print("%-*s  %-9s  %s" % (width, name, state, entries))
 
+    cloudflare_protected = False
     for zone in sorted(set([default_zone, FALLBACK_ZONE])):
         rules = [r for r in list_rich_rules(runner, zone) if rule_ipset(r)]
         sources = [s for s in list_sources(runner, zone) if s.startswith("ipset:")]
+        if any(rule_ipset(r) in CLOUDFLARE_IPSETS for r in rules):
+            cloudflare_protected = True
         print()
         print(
             "zone %s: %d ipset rich rule(s), %d ipset source(s)"
@@ -667,6 +944,16 @@ def cmd_show(runner, config, counts=True):
     if not counts:
         print()
         print("entry counts omitted (--no-counts)")
+
+    print()
+    print(
+        "cloudflare allowlist: %s"
+        % (
+            "active (see 'cloudflare status' for details)"
+            if cloudflare_protected
+            else "NOT ENABLED - run './blocklist-firewalld.py cloudflare enable'"
+        )
+    )
     return 0
 
 
@@ -738,8 +1025,11 @@ def cmd_generate(runner, mode, countries=None, output=CONFIG_NAME, aggregated=Tr
 # --------------------------------------------------------------------------- #
 
 
-def cmd_setup(runner, config):
-    for step in (cmd_create, cmd_flush, cmd_populate):
+def cmd_setup(runner, config, protect_cloudflare=True):
+    code = cmd_create(runner, config, protect_cloudflare=protect_cloudflare)
+    if code:
+        return code
+    for step in (cmd_flush, cmd_populate):
         code = step(runner, config)
         if code:
             return code
@@ -811,12 +1101,21 @@ def build_parser():
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    subparsers.add_parser(
+    setup = subparsers.add_parser(
         "setup", parents=[common], help="create + flush + populate (default)"
     )
-    subparsers.add_parser(
+    create = subparsers.add_parser(
         "create", parents=[common], help="create ipsets and firewalld rules"
     )
+    for sub in (setup, create):
+        sub.add_argument(
+            "--no-cloudflare-allowlist",
+            dest="protect_cloudflare",
+            action="store_false",
+            default=True,
+            help="do not add the Cloudflare allowlist (accept rules that keep "
+            "Cloudflare's own IPs from ever being blocked by this tool)",
+        )
     subparsers.add_parser(
         "populate", parents=[common], help="download blocklists and load the IPs"
     )
@@ -877,6 +1176,27 @@ def build_parser():
         action="store_true",
         help="use non-aggregated zone files " "(more IP blocks, slower)",
     )
+
+    cloudflare = subparsers.add_parser(
+        "cloudflare",
+        parents=[common],
+        help="manage the Cloudflare allowlist (never block Cloudflare's own IPs)",
+    )
+    cloudflare.add_argument(
+        "action",
+        nargs="?",
+        default="status",
+        choices=["enable", "refresh", "disable", "status"],
+        help="enable/refresh: create (if needed) and (re)populate the allowlist "
+        "ipsets and accept rules. disable: remove them. status (default): "
+        "show the current state.",
+    )
+    cloudflare.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="do not ask for confirmation (disable only)",
+    )
     return parser
 
 
@@ -887,7 +1207,7 @@ def main(argv=None):
     runner = Runner(verbose=args.verbose, dry_run=args.dry_run)
     command = args.command or "setup"
 
-    # generate is the only command that does not need an existing config
+    # generate and cloudflare are independent of blocklist.json
     if command == "generate":
         return cmd_generate(
             runner,
@@ -897,11 +1217,18 @@ def main(argv=None):
             aggregated=not args.no_aggregated,
         )
 
+    if command == "cloudflare":
+        if args.action in ("enable", "refresh"):
+            return ensure_cloudflare_allowlist(runner)
+        if args.action == "disable":
+            return cmd_cloudflare_disable(runner, assume_yes=args.yes)
+        return cmd_cloudflare_status(runner)
+
     path, config = load_config(args.config)
     runner.log("using config %s (%d blocklist(s))" % (path, len(config)))
 
     if command == "create":
-        code = cmd_create(runner, config)
+        code = cmd_create(runner, config, protect_cloudflare=args.protect_cloudflare)
     elif command == "populate":
         code = cmd_populate(runner, config)
     elif command == "flush":
@@ -915,7 +1242,9 @@ def main(argv=None):
     elif command == "show":
         code = cmd_show(runner, config, counts=args.counts)
     else:
-        code = cmd_setup(runner, config)
+        code = cmd_setup(
+            runner, config, protect_cloudflare=getattr(args, "protect_cloudflare", True)
+        )
 
     if code == 0 and runner.failures:
         print(

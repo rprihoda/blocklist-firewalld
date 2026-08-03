@@ -71,6 +71,7 @@ positional arguments:
     revert              undo all firewall changes: remove rules and delete ipsets
     show                show the current ipsets and rules
     generate            write a blocklist.json configuration
+    cloudflare          manage the Cloudflare allowlist (never block Cloudflare's own IPs)
 
 options:
   -h, --help            show this help message and exit
@@ -95,6 +96,7 @@ Run without a sub-command to perform the full setup (create + flush + populate).
 | `revert` | **Full undo.** Removes the rules *and* deletes the ipsets, returning the firewall to its pre-setup state. |
 | `show` | Prints the current ipsets, their entry counts, and the rules that reference them. |
 | `generate` | Writes a `blocklist.json` configuration (replaces the old `generate-blocklist.py`). |
+| `cloudflare` | Manages a safety-net allowlist so this tool can never block Cloudflare itself. See [Cloudflare Allowlist](#cloudflare-allowlist). |
 
 ### Global Options
 
@@ -353,6 +355,96 @@ By default `revert` also cleans up **leftovers**: any ipset named `blocklist-*` 
 what you want after switching configurations (e.g. from `allow-us` to `block-threats`),
 since those 200+ orphaned ipsets would otherwise keep filtering traffic forever. Pass
 `--only-config` if you have ipsets with those prefixes that you manage yourself.
+
+### Cloudflare Allowlist
+
+**If your site is behind Cloudflare, read this before running `setup`/`create`.**
+
+Cloudflare's IP ranges are shared by every site on their network. This tool's
+blocklists can end up blocking Cloudflare itself in two ways:
+
+1. **Abuse lists (blocklist.de) flag a Cloudflare edge IP.** These lists are
+   crowd-sourced from server logs across the internet. If some *other*
+   Cloudflare-fronted site gets attacked, the victim's logs show Cloudflare's
+   edge IP as the source (not the real attacker), and that IP can get reported
+   and land on the public abuse list. Once it's downloaded into your
+   `blocklist-443`/`blocklist-80` ipset, your rich rule drops **anyone**
+   connecting from it on that port - including Cloudflare connecting to your
+   own origin. Symptom: intermittent Cloudflare 521/522/525 errors for
+   visitors, with no obvious cause in your application logs.
+2. **Country-based blocking (`allow-us` / `block-specific`) drops a whole
+   country's netblocks**, which can include Cloudflare PoPs registered in
+   that country - even though Cloudflare isn't the threat. This is a
+   well-known gotcha with any geo-IP firewall in front of a CDN-fronted site.
+
+**The fix:** `blocklist-firewalld.py create` (and therefore `setup`, and
+therefore the default cron-driven run) automatically maintains a small
+allowlist alongside your regular blocklists:
+
+- Two ipsets, `cloudflare-allow` (IPv4) and `cloudflare-allow6` (IPv6),
+  populated straight from Cloudflare's own
+  [published ranges](https://www.cloudflare.com/ips/) - refreshed on every
+  `create`/`setup` run, with a built-in fallback snapshot if the download
+  fails (e.g. no internet access at that moment).
+- A rich rule in every zone this tool manages, with a very low priority
+  (`-32000`) that `accept`s traffic from those ipsets. Firewalld evaluates
+  rich rules in ascending priority order and stops at the first match, so
+  this ACCEPT is always checked - and always wins - **before** any DROP rule
+  this tool adds at the default priority of `0`. It doesn't matter what later
+  ends up in an abuse list or a country ipset: Cloudflare's own ranges are
+  never blocked by this tool.
+- Deliberately excluded from `clean`/`revert`'s cleanup: undoing your
+  blocklists never removes this safety net.
+
+This is **on by default**. To check, enable, refresh, or remove it explicitly:
+
+```bash
+# Show whether Cloudflare is currently protected
+./blocklist-firewalld.py cloudflare status
+
+# Create/refresh the allowlist ipsets and accept rules right now
+# (useful immediately after upgrading the script, without waiting for setup/create)
+sudo ./blocklist-firewalld.py cloudflare enable
+
+# Remove the allowlist entirely (Cloudflare becomes subject to your
+# regular blocklists/country rules again)
+sudo ./blocklist-firewalld.py cloudflare disable
+```
+
+To opt out (not recommended if you're behind Cloudflare):
+
+```bash
+sudo ./blocklist-firewalld.py create --no-cloudflare-allowlist
+sudo ./blocklist-firewalld.py setup  --no-cloudflare-allowlist
+```
+
+#### Diagnosing an active "Cloudflare can't reach my site" incident
+
+If Cloudflare is *currently* unable to reach your origin, apply the allowlist
+immediately - it takes effect right away and is safe to run at any time:
+
+```bash
+sudo ./blocklist-firewalld.py cloudflare enable
+```
+
+To confirm a Cloudflare IP was actually the culprit (rather than something
+else, like an expired origin cert or a DNS/routing issue), check whether any
+current Cloudflare range appears in your abuse-list ipsets:
+
+```bash
+# Get Cloudflare's current ranges
+curl -s https://www.cloudflare.com/ips-v4
+
+# Compare against what's actually blocked on port 443
+sudo firewall-cmd --ipset=blocklist-443 --get-entries
+sudo firewall-cmd --ipset=blocklist-80 --get-entries
+```
+
+If you were using country-based blocking (`allow-us`/`block-specific`) and
+Cloudflare access was flaky rather than fully broken, that's consistent with
+only *some* Cloudflare PoPs (those geolocated to blocked countries) being
+affected - `cloudflare enable` fixes this too, since the accept rule is
+zone-wide and doesn't care which ipset would otherwise have caught the IP.
 
 ### Verify Configuration
 
