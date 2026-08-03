@@ -34,8 +34,10 @@ ETC_CONFIG_DIR = "/etc/blocklist"
 IPSET_TYPE = "hash:net"
 IPSET_OPTIONS = ("family=inet", "hashsize=4096", "maxelem=200000")
 
-# ipsets named after a service/port get a rich rule scoped to that port.
-# Anything else is dropped outright via the fallback zone.
+# Default ports for well-known ipset names, used only when a config entry
+# doesn't specify its own 'ports' (see entry_ports()). ipsets that end up
+# with no ports at all are dropped outright via the fallback zone instead of
+# a port-scoped rich rule.
 PORT_MAP = {"blocklist-ssh": "22", "blocklist-80": "80", "blocklist-443": "443"}
 FALLBACK_ZONE = "drop"
 
@@ -43,6 +45,7 @@ FALLBACK_ZONE = "drop"
 MANAGED_PREFIXES = ("blocklist-", "country-")
 
 RICH_RULE_IPSET_RE = re.compile(r'ipset="?([^"\s]+)"?')
+RICH_RULE_PORT_RE = re.compile(r'port="?(\d+)"?')
 
 # All country codes available from ipdeny.com
 # fmt: off
@@ -271,8 +274,65 @@ def find_config(explicit=None):
     )
 
 
+def entry_name(value):
+    """ipset name for a blocklist.json entry: a plain string, or a dict's 'ipset'."""
+    return value if isinstance(value, str) else value["ipset"]
+
+
+def entry_ports(value, name):
+    """TCP ports to scope a rich-rule DROP to for this entry, or None.
+
+    An explicit 'ports' list on a dict-form entry always wins. Otherwise fall
+    back to PORT_MAP's conventional port for well-known names. None means no
+    port scoping at all - the ipset is added as a source of FALLBACK_ZONE,
+    dropping every port from it.
+    """
+    if isinstance(value, dict) and value.get("ports"):
+        return tuple(str(port) for port in value["ports"])
+    default_port = PORT_MAP.get(name)
+    return (default_port,) if default_port else None
+
+
+def validate_config_entry(path, url, value):
+    if isinstance(value, str):
+        if not value:
+            die("%s: ipset name for %s must be a non-empty string" % (path, url))
+        return
+    if isinstance(value, dict):
+        name = value.get("ipset")
+        if not isinstance(name, str) or not name:
+            die("%s: entry for %s must have a non-empty 'ipset' name" % (path, url))
+        ports = value.get("ports")
+        if ports is not None:
+            if not isinstance(ports, list) or not ports:
+                die("%s: 'ports' for %s must be a non-empty list" % (path, url))
+            for port in ports:
+                if isinstance(port, bool) or not isinstance(port, (int, str)):
+                    die(
+                        "%s: invalid port %r for %s (use an int or numeric string)"
+                        % (path, port, url)
+                    )
+                if not str(port).strip().isdigit():
+                    die(
+                        "%s: invalid port %r for %s (use an int or numeric string)"
+                        % (path, port, url)
+                    )
+        return
+    die(
+        "%s: entry for %s must be a string ipset name, or an object like "
+        '{"ipset": "name", "ports": [22, 2222]}' % (path, url)
+    )
+
+
 def load_config(explicit=None):
-    """Return {url: ipset_name} from the first config file found."""
+    """Return {url: entry} from the first config file found.
+
+    Each entry is either a plain ipset-name string (the common case), or a
+    dict {"ipset": name, "ports": [...]} when a config needs to scope one
+    ipset's block rule to specific ports - e.g. a git server whose SSH is
+    reachable on both 22 and a container-mapped 2222. Use entry_name()/
+    entry_ports() to read entries; don't assume they're plain strings.
+    """
     path = find_config(explicit)
     try:
         with open(str(path)) as handle:
@@ -285,13 +345,12 @@ def load_config(explicit=None):
     if not isinstance(data, dict) or not data:
         die("%s must be a non-empty JSON object of {url: ipset-name}" % path)
 
-    for url, name in data.items():
-        if not isinstance(name, str) or not name:
-            die("%s: ipset name for %s must be a non-empty string" % (path, url))
+    for url, value in data.items():
+        validate_config_entry(path, url, value)
 
     seen = {}
-    for url, name in data.items():
-        seen.setdefault(name, []).append(url)
+    for url, value in data.items():
+        seen.setdefault(entry_name(value), []).append(url)
     for name, urls in seen.items():
         if len(urls) > 1:
             Runner.warn(
@@ -304,7 +363,28 @@ def load_config(explicit=None):
 
 def sorted_lists(config):
     """Config as [(url, ipset_name)] sorted by ipset name for stable output."""
-    return sorted(config.items(), key=lambda item: item[1])
+    return sorted(
+        ((url, entry_name(value)) for url, value in config.items()),
+        key=lambda item: item[1],
+    )
+
+
+def sorted_entries(config):
+    """Config as [(url, ipset_name, ports)] sorted by ipset name.
+
+    ports is entry_ports()'s result: a tuple of TCP ports to scope a rich
+    rule to, or None for a zone-wide drop via FALLBACK_ZONE.
+    """
+    rows = []
+    for url, value in config.items():
+        name = entry_name(value)
+        rows.append((url, name, entry_ports(value, name)))
+    return sorted(rows, key=lambda item: item[1])
+
+
+def config_names(config):
+    """Every ipset name referenced by the config (normalizes str/dict entries)."""
+    return {entry_name(value) for value in config.values()}
 
 
 # --------------------------------------------------------------------------- #
@@ -366,6 +446,11 @@ def rich_rule(name, port):
 
 def rule_ipset(rule):
     match = RICH_RULE_IPSET_RE.search(rule)
+    return match.group(1) if match else None
+
+
+def rule_port(rule):
+    match = RICH_RULE_PORT_RE.search(rule)
     return match.group(1) if match else None
 
 
@@ -608,11 +693,15 @@ def cmd_create(runner, config, protect_cloudflare=True):
     existing_ipsets = get_ipsets(runner, permanent=True)
     existing_rules = list_rich_rules(runner, default_zone)
     existing_sources = set(list_sources(runner, FALLBACK_ZONE))
-    ruled_ipsets = set(filter(None, (rule_ipset(r) for r in existing_rules)))
+    ruled_ports = set()
+    for r in existing_rules:
+        r_name, r_port = rule_ipset(r), rule_port(r)
+        if r_name and r_port:
+            ruled_ports.add((r_name, r_port))
 
     created = 0
     ruled = 0
-    for _url, name in sorted_lists(config):
+    for _url, name, ports in sorted_entries(config):
         if name in existing_ipsets:
             runner.log("ipset already exists: " + name)
         else:
@@ -629,19 +718,23 @@ def cmd_create(runner, config, protect_cloudflare=True):
                 continue
             created += 1
 
-        port = PORT_MAP.get(name)
-        if port:
-            if name in ruled_ipsets:
-                runner.log("rich rule already present for " + name)
-                continue
-            result = fw(
-                runner,
-                "--permanent",
-                "--zone=" + default_zone,
-                "--add-rich-rule=" + rich_rule(name, port),
-                description="Blocking %s on port %s in zone %s"
-                % (name, port, default_zone),
-            )
+        if ports:
+            for port in ports:
+                if (name, port) in ruled_ports:
+                    runner.log(
+                        "rich rule already present for %s on port %s" % (name, port)
+                    )
+                    continue
+                result = fw(
+                    runner,
+                    "--permanent",
+                    "--zone=" + default_zone,
+                    "--add-rich-rule=" + rich_rule(name, port),
+                    description="Blocking %s on port %s in zone %s"
+                    % (name, port, default_zone),
+                )
+                if result.ok:
+                    ruled += 1
         else:
             if "ipset:" + name in existing_sources:
                 runner.log("already a source of zone %s: %s" % (FALLBACK_ZONE, name))
@@ -653,8 +746,8 @@ def cmd_create(runner, config, protect_cloudflare=True):
                 "--add-source=ipset:" + name,
                 description="Adding %s to zone %s" % (name, FALLBACK_ZONE),
             )
-        if result.ok:
-            ruled += 1
+            if result.ok:
+                ruled += 1
 
     reload_firewalld(runner)
     print("created %d ipset(s), added %d firewall rule(s)" % (created, ruled))
@@ -801,7 +894,7 @@ def managed_ipsets(runner, config, only_config=False):
     one of the managed prefixes, so leftovers from an earlier blocklist.json
     are cleaned up too.
     """
-    targets = set(config.values())
+    targets = config_names(config)
     if only_config:
         return targets
     known = get_ipsets(runner, permanent=True) | get_ipsets(runner)
@@ -822,7 +915,7 @@ def cmd_clean(runner, config):
     require_root(runner)
     require_firewalld(runner)
 
-    removed = remove_firewall_rules(runner, set(config.values()))
+    removed = remove_firewall_rules(runner, config_names(config))
     reload_firewalld(runner)
     print("removed %d firewall rule(s); ipsets left in place" % removed)
     if removed:
@@ -842,7 +935,7 @@ def cmd_revert(runner, config, only_config=False, assume_yes=False):
 
     permanent = get_ipsets(runner, permanent=True)
     to_delete = sorted(name for name in targets if name in permanent)
-    orphans = sorted(targets - set(config.values()))
+    orphans = sorted(targets - config_names(config))
 
     print("About to revert the firewall changes for %d ipset(s):" % len(targets))
     print("  every rule and zone source referencing them will be removed")
@@ -890,7 +983,7 @@ def cmd_show(runner, config, counts=True):
     default_zone = get_default_zone(runner)
     runtime = get_ipsets(runner)
     permanent = get_ipsets(runner, permanent=True)
-    configured = sorted_lists(config)
+    configured = sorted_entries(config)
 
     print("default zone: %s" % default_zone)
     print(
@@ -899,10 +992,10 @@ def cmd_show(runner, config, counts=True):
     )
     print()
 
-    width = max([len(name) for _u, name in configured] + [5])
-    print("%-*s  %-9s  %s" % (width, "IPSET", "STATE", "ENTRIES"))
+    width = max([len(name) for _u, name, _ports in configured] + [5])
+    print("%-*s  %-9s  %-10s  %s" % (width, "IPSET", "STATE", "PORTS", "ENTRIES"))
     missing = 0
-    for _url, name in configured:
+    for _url, name, ports in configured:
         if name in runtime:
             state = "active"
         elif name in permanent:
@@ -914,7 +1007,8 @@ def cmd_show(runner, config, counts=True):
             entries = str(len(get_entries(runner, name)))
         else:
             entries = "-"
-        print("%-*s  %-9s  %s" % (width, name, state, entries))
+        port_label = ",".join(ports) if ports else "any (drop zone)"
+        print("%-*s  %-9s  %-10s  %s" % (width, name, state, port_label, entries))
 
     cloudflare_protected = False
     for zone in sorted(set([default_zone, FALLBACK_ZONE])):

@@ -116,7 +116,8 @@ Create a JSON file called blocklist.json in one of the following locations:
  - $HOME/blocklist.json
  - "Right next to the script"
 
-Its format is pretty simple. Key is the URL of the blocklist, the value is the name of the ipset it creates from the blocklist.
+Its format is pretty simple. Key is the URL of the blocklist, the value is the
+name of the ipset it creates from the blocklist:
 
 ```json
 {
@@ -125,6 +126,39 @@ Its format is pretty simple. Key is the URL of the blocklist, the value is the n
     "https://lists.blocklist.de/lists/443.txt" : "blocklist-443"
 }
 ```
+
+For `blocklist-ssh`/`blocklist-80`/`blocklist-443`, the DROP rich rule is
+automatically scoped to the conventional port (22/80/443). Any other ipset
+name gets no port scoping at all - it's added as a source of the `drop` zone
+instead, blocking **every** port from those IPs (see
+[How It Works](#how-it-works)).
+
+**Scoping to specific ports (or more than one):** if the conventional single
+port doesn't match your setup - e.g. a git server whose SSH is reachable on
+both the host's port 22 *and* a container-mapped port like 2222 - use the
+object form instead of a plain string:
+
+```json
+{
+    "https://lists.blocklist.de/lists/ssh.txt": {"ipset": "blocklist-ssh", "ports": [22, 2222]},
+    "https://lists.blocklist.de/lists/80.txt": "blocklist-80",
+    "https://lists.blocklist.de/lists/443.txt": "blocklist-443"
+}
+```
+
+- `ipset` (required in object form): the ipset name, same as the plain-string form.
+- `ports` (optional): a non-empty list of ports (ints or numeric strings) to
+  add a rich rule for. `create` adds one DROP rich rule per port, and leaves
+  any that already exist alone - so upgrading an existing single-port entry
+  to a list only adds the *new* port(s), it never touches or duplicates the
+  original rule.
+- Omitting `ports` on the object form falls back to the same conventional
+  port as the plain-string form (for well-known names) or the `drop` zone
+  (for anything else) - `{"ipset": "blocklist-ssh"}` behaves exactly like
+  `"blocklist-ssh"`.
+
+`show` displays each configured ipset's ports in a `PORTS` column so you can
+confirm what's actually being scoped.
 
 You can find further readily available blocklists on the following sites.
  - https://lists.blocklist.de
@@ -229,14 +263,23 @@ The script automatically creates **firewalld rich rules** that apply ipsets to s
 - `blocklist-80` → Blocks IPs on **port 80** (HTTP)
 - `blocklist-443` → Blocks IPs on **port 443** (HTTPS)
 
+These are just the conventional defaults for those three names. Use the
+[object form](#configuration) in `blocklist.json` to scope any ipset to a
+different port, or to more than one port at once - e.g. an SSH service
+reachable on both 22 and a container-mapped 2222 gets **two** rich rules
+from the same ipset and the same downloaded IP list.
+
 The rich rules are added to your **default zone** (usually `public`), so they work alongside your existing firewall configuration.
 
-**Example rich rule created:**
+**Example rich rules created (one per configured port):**
 ```
 rule source ipset=blocklist-ssh port port=22 protocol=tcp drop
+rule source ipset=blocklist-ssh port port=2222 protocol=tcp drop
 ```
 
-If you add custom ipsets that don't match the naming pattern, they'll be added to the `drop` zone instead (blocking all traffic from those IPs).
+If you add custom ipsets that don't match the naming pattern and don't specify
+`ports` in the object form, they'll be added to the `drop` zone instead
+(blocking all traffic from those IPs, on every port).
 
 **⚠️ The ipsets themselves are permanent, but their entries are not.** `populate`
 loads IPs into the *runtime* configuration, so a `firewall-cmd --reload` (or a
